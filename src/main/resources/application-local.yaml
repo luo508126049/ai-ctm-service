@@ -1,0 +1,12 @@
+spring:
+  ai:
+    model:
+      chat: deepseek
+    deepseek:
+      api-key: ${DEEPSEEK_API_KEY:${deepseek.api-key}}
+      chat:
+        model: ${DEEPSEEK_CHAT_MODEL:deepseek-chat}
+        temperature: ${AI_CHAT_TEMPERATURE:0.3}
+
+deepseek:
+  api-key: ${DEEPSEEK_API_KEY:}

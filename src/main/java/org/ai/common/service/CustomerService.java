@@ -1,123 +1,80 @@
 package org.ai.common.service;
 
-import dev.langchain4j.data.document.Document;
-import dev.langchain4j.data.document.DocumentSplitter;
-import dev.langchain4j.data.document.loader.FileSystemDocumentLoader;
-import dev.langchain4j.data.document.parser.TextDocumentParser;
-import dev.langchain4j.data.document.splitter.DocumentSplitters;
-import dev.langchain4j.data.segment.TextSegment;
-import dev.langchain4j.model.embedding.EmbeddingModel;
-import dev.langchain4j.model.openai.OpenAiChatModel;
-import dev.langchain4j.model.openai.OpenAiStreamingChatModel;
-import dev.langchain4j.rag.content.retriever.ContentRetriever;
-import dev.langchain4j.rag.content.retriever.EmbeddingStoreContentRetriever;
-import dev.langchain4j.service.AiServices;
-import dev.langchain4j.service.SystemMessage;
-import dev.langchain4j.service.TokenStream;
-import dev.langchain4j.service.UserMessage;
-import dev.langchain4j.store.embedding.EmbeddingStore;
-import dev.langchain4j.store.embedding.inmemory.InMemoryEmbeddingStore;
-import jakarta.annotation.PostConstruct;
-import org.springframework.beans.factory.annotation.Autowired;
+import org.ai.common.tool.CustomerBusinessTools;
+import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.List;
 
 @Service
 public class CustomerService {
 
-    interface Assistant {
-        @SystemMessage("你是一个专业的客服助理。\n"
-                + "请根据提供的\"知识库内容\"来回答用户的问题。\n"
-                + "如果知识库中没有相关信息，请礼貌地告知用户你不知道，并建议转接人工客服。\n"
-                + "严禁编造答案。")
-        String chat(@UserMessage String userMessage);
+    private static final String SYSTEM_PROMPT = """
+            你是一个企业客服与业务助手。
+            你可以回答普通客服问题，也可以在用户询问统计数据、查询结果或业务流程处理时调用工具。
+            调用工具前先判断用户意图，工具返回后用简洁中文解释结果。
+            如果用户请求缺少必要参数，请先追问，不要编造数据。
+            涉及写入、创建流程、状态变更类操作时，需要在回复中明确说明已经触发的是系统工具能力。
+            """;
+
+    private final ChatClient chatClient;
+    private final CustomerBusinessTools customerBusinessTools;
+
+    public CustomerService(ChatClient.Builder chatClientBuilder, CustomerBusinessTools customerBusinessTools) {
+        this.chatClient = chatClientBuilder
+                .defaultSystem(SYSTEM_PROMPT)
+                .build();
+        this.customerBusinessTools = customerBusinessTools;
     }
 
-    interface StreamingAssistant {
-        @SystemMessage("你是一个专业的客服助理。\n"
-                + "请根据提供的\"知识库内容\"来回答用户的问题。\n"
-                + "如果知识库中没有相关信息，请礼貌地告知用户你不知道，并建议转接人工客服。\n"
-                + "严禁编造答案。")
-        TokenStream chat(@UserMessage String userMessage);
-    }
-
-    @Autowired
-    private EmbeddingModel embeddingModel;
-
-    @Autowired
-    private OpenAiChatModel chatModel;
-
-    @Autowired
-    private OpenAiStreamingChatModel streamingChatModel;
-
-    private Assistant assistant;
-    private StreamingAssistant streamingAssistant;
-
-    @PostConstruct
-    public void init() {
-        System.out.println("正在加载知识库文档...");
-
-        Path knowledgeBasePath = Paths.get("src/main/resources/knowledge_base");
-        List<Document> documents = FileSystemDocumentLoader.loadDocuments(
-                knowledgeBasePath,
-                doc -> doc.getFileName().toString().endsWith(".txt"),
-                new TextDocumentParser()
-        );
-        System.out.println("已加载 " + documents.size() + " 个文档");
-
-        DocumentSplitter splitter = DocumentSplitters.recursive(500, 50);
-        List<TextSegment> segments = splitter.splitAll(documents);
-        System.out.println("文档已切分为 " + segments.size() + " 个片段");
-
-        System.out.println("正在生成向量索引，首次运行可能需要下载模型，请稍等...");
-        EmbeddingStore<TextSegment> embeddingStore = new InMemoryEmbeddingStore<>();
-        embeddingStore.addAll(embeddingModel.embedAll(segments).content(), segments);
-        System.out.println("向量索引创建完成");
-
-        ContentRetriever contentRetriever = EmbeddingStoreContentRetriever.builder()
-                .embeddingStore(embeddingStore)
-                .embeddingModel(embeddingModel)
-                .maxResults(3)
-                .build();
-
-        this.assistant = AiServices.builder(Assistant.class)
-                .chatLanguageModel(chatModel)
-                .contentRetriever(contentRetriever)
-                .build();
-
-        this.streamingAssistant = AiServices.builder(StreamingAssistant.class)
-                .streamingChatLanguageModel(streamingChatModel)
-                .contentRetriever(contentRetriever)
-                .build();
-    }
-
+    /**
+     * 执行一次普通对话，模型可根据用户意图自动调用业务工具。
+     *
+     * @param userMessage 用户输入
+     * @return AI 生成的最终回复
+     */
     public String chat(String userMessage) {
-        return assistant.chat(userMessage);
+        return chatClient.prompt()
+                .user(userMessage)
+                .tools(customerBusinessTools)
+                .call()
+                .content();
     }
 
+    /**
+     * 执行流式对话，模型可根据用户意图自动调用业务工具。
+     *
+     * @param userMessage 用户输入
+     * @param emitter     SSE 输出通道
+     */
     public void chatStream(String userMessage, SseEmitter emitter) {
-        streamingAssistant.chat(userMessage)
-                .onNext(token -> {
-                    try {
-                        emitter.send(token);
-                    } catch (IOException e) {
-                        emitter.completeWithError(e);
-                    }
-                })
-                .onComplete(response -> {
-                    try {
-                        emitter.send(SseEmitter.event().name("complete").data("[DONE]"));
-                        emitter.complete();
-                    } catch (IOException e) {
-                        emitter.completeWithError(e);
-                    }
-                })
-                .onError(emitter::completeWithError)
-                .start();
+        chatClient.prompt()
+                .user(userMessage)
+                .tools(customerBusinessTools)
+                .stream()
+                .content()
+                .subscribe(
+                        token -> sendToken(emitter, token),
+                        emitter::completeWithError,
+                        () -> completeStream(emitter)
+                );
+    }
+
+    private void sendToken(SseEmitter emitter, String token) {
+        try {
+            emitter.send(token);
+        } catch (IOException e) {
+            emitter.completeWithError(e);
+        }
+    }
+
+    private void completeStream(SseEmitter emitter) {
+        try {
+            emitter.send(SseEmitter.event().name("complete").data("[DONE]"));
+            emitter.complete();
+        } catch (IOException e) {
+            emitter.completeWithError(e);
+        }
     }
 }
